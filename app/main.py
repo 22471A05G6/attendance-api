@@ -17,6 +17,8 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from pymongo import MongoClient
 
+from decimal import Decimal, ROUND_HALF_UP
+
 load_dotenv()
 
 client = MongoClient(os.getenv("MONGO_URI", "mongodb://localhost:27017"))
@@ -38,8 +40,9 @@ def compute_late_minutes(punch_in: datetime, shift_start: str) -> int:
 
 
 def compute_work_hours(punch_in: datetime, punch_out: datetime) -> float:
-    return round((punch_out - punch_in).total_seconds() / 3600, 2)
-
+    seconds=int((punch_out-punch_in).total_seconds())
+    hours = Decimal(seconds)/Decimal(3600)
+    return float(hours.quantize(Decimal(0.01), rounding=ROUND_HALF_UP))
 
 def compute_overtime(punch_out: datetime, shift_end: str, date_str: str) -> int:
     h, m = map(int, shift_end.split(":"))

@@ -32,11 +32,16 @@ app = FastAPI(title="Employee Attendance & Analytics API", version="2.0.0")
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
-def compute_late_minutes(punch_in: datetime, shift_start: str) -> int:
-    h, m = map(int, shift_start.split(":"))
-    start = punch_in.replace(hour=h, minute=m, second=0, microsecond=0)
-    minutes = int((punch_in - start).total_seconds() / 60)
-    return minutes if minutes > 10 else 0
+def shift_start_dt( date_str:str,hhmm:str) -> datetime:
+    h, m = map(int, hhmm.split(":"))
+    return datetime.fromisoformat(date_str).replace(hour=h, minute=m, tzinfo=IST)
+
+
+def compute_late_minutes(punch_in: datetime, shift_start: datetime) -> int:
+    punch_in=punch_in.replace(microsecond=0)
+    seconds=int((punch_in - shift_start).total_seconds())
+    return seconds // 60 if seconds>600 else 0 
+    
 
 
 def compute_work_hours(punch_in: datetime, punch_out: datetime) -> float:

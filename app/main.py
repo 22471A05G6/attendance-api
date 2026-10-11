@@ -43,16 +43,38 @@ def compute_late_minutes(punch_in: datetime, shift_start: datetime) -> int:
     return seconds // 60 if seconds>600 else 0 
     
 
-
 def compute_work_hours(punch_in: datetime, punch_out: datetime) -> float:
     seconds=int((punch_out-punch_in).total_seconds())
     hours = Decimal(seconds)/Decimal(3600)
     return float(hours.quantize(Decimal(0.01), rounding=ROUND_HALF_UP))
 
-def compute_overtime(punch_out: datetime, shift_end: str, date_str: str) -> int:
-    h, m = map(int, shift_end.split(":"))
-    end = datetime.fromisoformat(date_str).replace(hour=h, minute=m, tzinfo=IST)
-    return max(0, int((punch_out - end).total_seconds() / 60))
+def shift_end_dt(date_str: str, shift_start: str, shift_end: str) -> datetime:
+    sh, sm = map(int, shift_start.split(":"))
+    eh, em = map(int, shift_end.split(":"))
+    end = datetime.fromisoformat(date_str).replace(hour=eh, minute=em, tzinfo=IST)
+    if (eh, em) <= (sh, sm):
+        end += timedelta(days=1)
+    return end
+
+def compute_overtime(punch_out: datetime, shift_end: datetime) -> int:
+    punch_out = punch_out.replace(microsecond=0)
+    seconds = int((punch_out - shift_end).total_seconds())
+    return seconds // 60 if seconds >= 1800 else 0
+
+EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+
+def ms_to_dt(ms: int) -> datetime:
+    return EPOCH + timedelta(milliseconds=ms)
+
+
+def dt_to_ms(dt: datetime) -> int:
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return (dt - EPOCH) // timedelta(milliseconds=1)
+    
+
+
 
 
 # --------------------------------------------------------------------------- #

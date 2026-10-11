@@ -8,13 +8,16 @@ This file was written quickly by a colleague who has left the company. The happy
 works, but nobody has reviewed it. Read PROBLEM_STATEMENT.docx for what is expected of you,
 openapi.yaml for the contract and DATA_MODEL.md for what is stored in MongoDB.
 """
+from dataclasses import field
 import os
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Annotated,Literal, Optional
+
+
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel,Field, StrictInt
 from pymongo import MongoClient
 
 from decimal import Decimal, ROUND_HALF_UP
@@ -69,15 +72,8 @@ def compute_overtime(punch_out: datetime, shift_end: datetime) -> int:
     punch_out = punch_out.replace(microsecond=0)
     seconds = int((punch_out - shift_end).total_seconds())
     return seconds // 60 if seconds >= 1800 else 0
-def attendance_date(punch_in: datetime, shift_start:str, shift_end:str)-> str:
-    ist_time = punch_in.replace(microsecond=0).astimezone(IST)
-    day = ist_time.date()
-    sh, sm = map(int, shift_start.split(":"))
-    eh, em = map(int, shift_end.split(":"))
-    is_overnight = (eh, em) <= (sh, sm)
-    if is_overnight and (ist_time.hour, ist_time.minute) < (eh, em):
-        day -= timedelta(days=1)
-    return day.isoformat()
+
+
 
 EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
@@ -91,6 +87,37 @@ def dt_to_ms(dt: datetime) -> int:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return (dt - EPOCH) // timedelta(milliseconds=1)
+
+def _ms_if_datetime(value):
+    return dt_to_ms(value) if instance(value, datetime) else value
+
+def serialize_record(doc:dict)-> dict:
+    history = [
+        {
+            "at":dt_to_ms(h["at"]),
+            "by":h["by"],
+            "reason" : h["reason"],
+            "changes" :{
+                field : {"from" : _ms_if_datetime(c["from"]), "to" : _ms_if_datetime(c["to"])}
+                 for field, c in h["changes"].items()
+            },
+        }
+        for h in (doc.get("history") or [])
+    ]
+    return{
+    "emp_code": doc["emp_code"],
+        "date": doc["date"],
+        "status": doc["status"],
+        "punch_in": None if doc.get("punch_in") is None else dt_to_ms(doc["punch_in"]),
+        "punch_out": None if doc.get("punch_out") is None else dt_to_ms(doc["punch_out"]),
+        "work_hours": doc.get("work_hours"),
+        "late_minutes": doc.get("late_minutes", 0),
+        "overtime_minutes": doc.get("overtime_minutes", 0),
+        "half_day": doc.get("half_day", False),
+        "history": history,
+    }
+
+
     
 
 
@@ -107,12 +134,12 @@ class EmployeeIn(BaseModel):
     shift_start: str = "09:30"
     shift_end: str = "18:30"
     joined_on: str
-
+EpoMs = Annotated[StrictInt, Field(ge=100_000_000_000, le=4_102_444_800_000)]
 
 class PunchInIn(BaseModel):
-    emp_code: str
-    punched_at: Optional[int] = None
-    status: str = "PRESENT"
+    emp_code: Field(min_length=1)
+    punched_at: Optional[EpoMs] = None
+    status: Literal["PRESENT", "WFH","ON_DUTY"] = "PRESENT"
 
 
 # --------------------------------------------------------------------------- #

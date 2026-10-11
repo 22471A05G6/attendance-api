@@ -55,13 +55,32 @@ def shift_end_dt(date_str: str, shift_start: str, shift_end: str) -> datetime:
     if (eh, em) <= (sh, sm):
         end += timedelta(days=1)
     return end
+def attendance_date(punch_in: datetime, shift_start: str, shift_end: str) -> str:
+    ist_time = punch_in.replace(microsecond=0).astimezone(IST)
+    day = ist_time.date()
+    sh, sm = map(int, shift_start.split(":"))
+    eh, em = map(int, shift_end.split(":"))
+    is_overnight = (eh, em) <= (sh, sm)
+    if is_overnight and (ist_time.hour, ist_time.minute) < (eh, em):
+        day -= timedelta(days=1)
+    return day.isoformat()
 
 def compute_overtime(punch_out: datetime, shift_end: datetime) -> int:
     punch_out = punch_out.replace(microsecond=0)
     seconds = int((punch_out - shift_end).total_seconds())
     return seconds // 60 if seconds >= 1800 else 0
+def attendance_date(punch_in: datetime, shift_start:str, shift_end:str)-> str:
+    ist_time = punch_in.replace(microsecond=0).astimezone(IST)
+    day = ist_time.date()
+    sh, sm = map(int, shift_start.split(":"))
+    eh, em = map(int, shift_end.split(":"))
+    is_overnight = (eh, em) <= (sh, sm)
+    if is_overnight and (ist_time.hour, ist_time.minute) < (eh, em):
+        day -= timedelta(days=1)
+    return day.isoformat()
 
 EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
 
 
 def ms_to_dt(ms: int) -> datetime:

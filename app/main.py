@@ -18,7 +18,9 @@ from typing import Annotated,Literal, Optional
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel,Field, StrictInt
-from pymongo import MongoClient
+from pymongo import MongoClient,ASCENDING
+from contextlib import asynccontextmanager
+from pymongo.errors import DuplicateKeyError
 
 from decimal import Decimal, ROUND_HALF_UP
 
@@ -28,8 +30,20 @@ client = MongoClient(os.getenv("MONGO_URI", "mongodb://localhost:27017"))
 db = client[os.getenv("MONGO_DB", "attendance_db")]
 
 IST = timezone(timedelta(hours=5, minutes=30))
+def create_indexes():
+    db.attendance_logs.create_index(
+        [("emp_code", ASCENDING), ("date", ASCENDING)],
+        unique = True,
+        name = "uniq_emp_date",
+    )
+    db.employees.create_index("emp_code", unique = True, name = "uniq_emp_code")
 
-app = FastAPI(title="Employee Attendance & Analytics API", version="2.0.0")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    create_indexes()
+    yield
+
+app = FastAPI(title="Employee Attendance & Analytics API", version="2.0.0",lifespan=lifespan)
 
 
 # --------------------------------------------------------------------------- #
@@ -137,7 +151,7 @@ class EmployeeIn(BaseModel):
 EpoMs = Annotated[StrictInt, Field(ge=100_000_000_000, le=4_102_444_800_000)]
 
 class PunchInIn(BaseModel):
-    emp_code: Field(min_length=1)
+    emp_code:str =  Field(min_length=1)
     punched_at: Optional[EpoMs] = None
     status: Literal["PRESENT", "WFH","ON_DUTY"] = "PRESENT"
 
@@ -175,10 +189,18 @@ def list_employees(department: Optional[str] = None, page: int = 1, page_size: i
 @app.post("/attendance/punch-in", status_code=201)
 def punch_in(body: PunchInIn):
     emp = db.employees.find_one({"emp_code": body.emp_code})
-    ts = datetime.fromtimestamp(body.punched_at / 1000) if body.punched_at else datetime.now()
-    d = ts.date().isoformat()
-    if db.attendance_logs.find_one({"emp_code": body.emp_code, "date": d}):
-        raise HTTPException(409, "already punched in for this date")
+    if emp is None:
+        raise HTTPException(404, "employee not found")
+    if body.punched_at is None:
+        ts = datetime.now(timezone.utc)
+    else:
+        ts = ms_to_dt(body.punched_at)
+    ts = ts.replace(microsecond=0)
+
+    d=attendance_date(ts, emp["shift_start"], emp["shift_end"])
+    late = compute_late_minutes(ts, shift_start_dt(d, emp["shift_start"]))
+
+    
     doc = {
         "emp_code": body.emp_code,
         "date": d,
@@ -186,15 +208,16 @@ def punch_in(body: PunchInIn):
         "punch_in": ts,
         "punch_out": None,
         "work_hours": None,
-        "late_minutes": compute_late_minutes(ts, emp["shift_start"]),
+        "late_minutes": late,
         "overtime_minutes": 0,
         "half_day": False,
         "history": [],
     }
-    res = db.attendance_logs.insert_one(doc)
-    doc["id"] = str(res.inserted_id)
-    doc.pop("_id", None)
-    return doc
+    try:
+        db.attendance_logs.insert_one(doc)
+    except DuplicateKeyError:
+        raise HTTPException(409, "already punched in for this date")
+    return serialize_record(doc)
 
 
 @app.get("/attendance")

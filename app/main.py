@@ -10,6 +10,7 @@ openapi.yaml for the contract and DATA_MODEL.md for what is stored in MongoDB.
 """
 
 import os
+import calendar
 from datetime import date,datetime, timedelta, timezone
 from typing import Annotated,Literal, Optional
 
@@ -406,6 +407,81 @@ def regularize(emp_code: str, record_date: str, body: RegularizeIn):
         raise HTTPException(409, "record was modified concurrently; retry")
     return serialize_record(updated)
 
+MONTH_PATTERN = r"^\d{4}-(0[1-9]|1[0-2])$"
+PRESENT_STATUSES = ["PRESENT", "WFH", "ON_DUTY"]
+
+
+def round_half_up(value, places: int) -> float:
+    q = Decimal(1).scaleb(-places)
+    return float(Decimal(str(value)).quantize(q, rounding=ROUND_HALF_UP))
+
+
+def month_bounds(month: str):
+    y, m = map(int, month.split("-"))
+    return date(y, m, 1), date(y, m, calendar.monthrange(y, m)[1])
+
+
+def count_working_days(start: date, end: date) -> int:
+    n, d = 0, start
+    while d <= end:
+        if d.weekday() < 5:          # Monday=0 ... Friday=4
+            n += 1
+        d += timedelta(days=1)
+    return n
+
+
+def monthly_pipeline(emp_code: str, first_iso: str, last_iso: str) -> list:
+    return [
+        {"$match": {"emp_code": emp_code, "date": {"$gte": first_iso, "$lte": last_iso}}},
+        {"$addFields": {
+            "dow": {"$dayOfWeek": {"$dateFromString": {"dateString": "$date", "format": "%Y-%m-%d"}}}
+        }},
+        {"$group": {
+            "_id": None,
+            "present_days": {"$sum": {"$cond": [
+                {"$and": [
+                    {"$in": ["$status", PRESENT_STATUSES]},
+                    {"$gte": ["$dow", 2]}, {"$lte": ["$dow", 6]},
+                ]},
+                {"$cond": [{"$eq": [{"$ifNull": ["$half_day", False]}, True]}, 0.5, 1]},
+                0,
+            ]}},
+            "leave_days": {"$sum": {"$cond": [{"$eq": ["$status", "LEAVE"]}, 1, 0]}},
+            "late_count": {"$sum": {"$cond": [{"$gt": [{"$ifNull": ["$late_minutes", 0]}, 0]}, 1, 0]}},
+            "total_late_minutes": {"$sum": {"$ifNull": ["$late_minutes", 0]}},
+            "total_overtime_minutes": {"$sum": {"$ifNull": ["$overtime_minutes", 0]}},
+        }},
+    ]
+
+
+@app.get("/analytics/employees/{emp_code}/monthly")
+def employee_monthly(emp_code: str, month: str = Query(..., pattern=MONTH_PATTERN)):
+    emp = db.employees.find_one({"emp_code": emp_code})
+    if emp is None:
+        raise HTTPException(404, "employee not found")
+    first, last = month_bounds(month)
+    joined = date.fromisoformat(emp["joined_on"])
+    working_days = count_working_days(max(first, joined), last)
+
+    rows = list(db.attendance_logs.aggregate(
+        monthly_pipeline(emp_code, first.isoformat(), last.isoformat())
+    ))
+    agg = rows[0] if rows else {}
+    present = agg.get("present_days", 0)
+    pct = None
+    if working_days > 0:
+        pct = round_half_up(Decimal(str(present)) / Decimal(working_days) * 100, 2)
+    return {
+        "emp_code": emp_code,
+        "month": month,
+        "working_days": working_days,
+        "present_days": round_half_up(present, 2),
+        "leave_days": agg.get("leave_days", 0),
+        "late_count": agg.get("late_count", 0),
+        "total_late_minutes": agg.get("total_late_minutes", 0),
+        "total_overtime_minutes": agg.get("total_overtime_minutes", 0),
+        "attendance_pct": pct,
+    }
 @app.post("/attendance/punch-out")
 def punch_out(body: PunchOutIn):
     emp = db.employees.find_one({"emp_code" : body.emp_code})

@@ -11,6 +11,8 @@ openapi.yaml for the contract and DATA_MODEL.md for what is stored in MongoDB.
 
 import os
 import calendar
+import json
+from bson import json_util
 from datetime import date,datetime, timedelta, timezone
 from typing import Annotated,Literal, Optional
 
@@ -47,6 +49,7 @@ def create_indexes():
     )
     db.employees.create_index("emp_code", unique=True, name="uniq_emp_code")
     db.employees.create_index([("joined_on", ASCENDING)], name="joined_on_idx")
+    db.employees.create_index([("department", ASCENDING)], name="department_idx")
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     create_indexes()
@@ -465,7 +468,8 @@ def employee_monthly(emp_code: str, month: str = Query(..., pattern=MONTH_PATTER
     working_days = count_working_days(max(first, joined), last)
 
     rows = list(db.attendance_logs.aggregate(
-        monthly_pipeline(emp_code, first.isoformat(), last.isoformat())
+        monthly_pipeline(emp_code, first.isoformat(), last.isoformat()),
+        hint="uniq_emp_date",
     ))
     agg = rows[0] if rows else {}
     present = agg.get("present_days", 0)
@@ -583,6 +587,158 @@ def late_leaderboard(month: str = Query(..., pattern=MONTH_PATTERN),
     pipeline = leaderboard_pipeline(first.isoformat(), last.isoformat(), limit, department)
     items = list(db.attendance_logs.aggregate(pipeline, hint="date_desc_emp"))
     return {"month": month, "items": items}
+def build_trend_pipeline(department: str, range_from: str, range_to: str) -> list:
+    check_date_param("from", range_from)
+    check_date_param("to", range_to)
+    d_from = date.fromisoformat(range_from)
+    d_to = date.fromisoformat(range_to)
+    if d_to < d_from:
+        raise RequestValidationError(
+            [{"type": "value_error", "loc": ("query", "to"),
+              "msg": "to must not be before from", "input": range_to}])
+    n_days = (d_to - d_from).days + 1
+    if n_days > 92:
+        raise RequestValidationError(
+            [{"type": "value_error", "loc": ("query", "to"),
+              "msg": "range must not exceed 92 days", "input": range_to}])
+    emps = list(db.employees.find({"department": department}, {"_id": 0, "emp_code": 1, "joined_on": 1}))
+    if not emps:
+        raise HTTPException(404, "department not found")
+    codes = [e["emp_code"] for e in emps]
+    joined = [e["joined_on"] for e in emps]
+    start_dt = datetime(d_from.year, d_from.month, d_from.day, tzinfo=timezone.utc)
+    return [
+        {"$match": {"department": department}},
+        {"$limit": 1},
+        {"$project": {"_id": 0, "offset": {"$range": [0, n_days]}}},
+        {"$unwind": "$offset"},
+        {"$addFields": {"d": {"$dateAdd": {"startDate": start_dt, "unit": "day", "amount": "$offset"}}}},
+        {"$addFields": {
+            "date": {"$dateToString": {"date": "$d", "format": "%Y-%m-%d"}},
+            "dow": {"$dayOfWeek": "$d"},
+        }},
+        {"$lookup": {
+            "from": "attendance_logs",
+            "let": {"day": "$date"},
+            "pipeline": [
+                {"$match": {"$expr": {"$eq": ["$date", "$$day"]}}},
+                {"$match": {"emp_code": {"$in": codes}}},
+            ],
+            "as": "logs",
+        }},
+        {"$addFields": {
+            "is_working_day": {"$and": [{"$gte": ["$dow", 2]}, {"$lte": ["$dow", 6]}]},
+            "headcount": {"$size": {"$filter": {
+                "input": {"$literal": joined}, "cond": {"$lte": ["$$this", "$date"]}}}},
+            "present_count": {"$sum": {"$map": {
+                "input": {"$filter": {"input": "$logs",
+                                      "cond": {"$in": ["$$this.status", PRESENT_STATUSES]}}},
+                "in": {"$cond": [{"$eq": [{"$ifNull": ["$$this.half_day", False]}, True]}, 0.5, 1]},
+            }}},
+            "late_count": {"$size": {"$filter": {
+                "input": "$logs",
+                "cond": {"$gt": [{"$ifNull": ["$$this.late_minutes", 0]}, 0]}}}},
+        }},
+        {"$addFields": {"rate": {"$cond": [
+            {"$and": ["$is_working_day", {"$gt": ["$headcount", 0]}]},
+            {"$divide": ["$present_count", "$headcount"]},
+            None]}}},
+        {"$setWindowFields": {"sortBy": {"d": 1},
+                              "output": {"moving": {"$avg": "$rate", "window": {"documents": [-6, 0]}}}}},
+        {"$project": {"_id": 0, "date": 1, "is_working_day": 1, "headcount": 1,
+                      "present_count": 1, "late_count": 1, "rate": 1, "moving": 1}},
+        {"$sort": {"date": 1}},
+    ]
+
+
+@app.get("/analytics/departments/{department}/trend")
+def department_trend(department: str,
+                     range_from: str = Query(..., alias="from", pattern=DATE_PATTERN),
+                     range_to: str = Query(..., alias="to", pattern=DATE_PATTERN)):
+    pipeline = build_trend_pipeline(department, range_from, range_to)
+    items = []
+    for r in db.employees.aggregate(pipeline, hint="department_idx"):
+        items.append({
+            "date": r["date"],
+            "is_working_day": r["is_working_day"],
+            "headcount": r["headcount"],
+            "present_count": round_half_up(r["present_count"], 2),
+            "late_count": r["late_count"],
+            "attendance_rate": None if r.get("rate") is None else round_half_up(r["rate"], 4),
+            "moving_avg_7d": None if r.get("moving") is None else round_half_up(r["moving"], 4),
+        })
+    return {"department": department, "items": items}
+
+
+def need(**params) -> None:
+    for name, value in params.items():
+        if value is None:
+            raise RequestValidationError(
+                [{"type": "missing", "loc": ("query", name), "msg": "Field required", "input": None}])
+
+
+@app.get("/admin/explain/{endpoint}")
+def explain_endpoint(
+    endpoint: Literal["attendance_list", "employee_monthly", "department_summary",
+                      "late_leaderboard", "department_trend"],
+    emp_code: Optional[str] = None,
+    month: Optional[str] = Query(None, pattern=MONTH_PATTERN),
+    department: Optional[str] = None,
+    limit: int = Query(10, ge=1, le=50),
+    date_from: Optional[str] = Query(None, pattern=DATE_PATTERN),
+    date_to: Optional[str] = Query(None, pattern=DATE_PATTERN),
+    status: Optional[Status] = None,
+    range_from: Optional[str] = Query(None, alias="from", pattern=DATE_PATTERN),
+    range_to: Optional[str] = Query(None, alias="to", pattern=DATE_PATTERN),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+):
+    if endpoint == "attendance_list":
+        check_date_param("date_from", date_from)
+        check_date_param("date_to", date_to)
+        if date_from and date_to and date_from > date_to:
+            raise RequestValidationError(
+                [{"type": "value_error", "loc": ("query", "date_from"),
+                  "msg": "date_from must not be after date_to", "input": date_from}])
+        coll = "attendance_logs"
+        cmd = {"find": coll,
+               "filter": attendance_filter(emp_code, date_from, date_to, status),
+               "sort": dict(ATTENDANCE_SORT),
+               "skip": (page - 1) * page_size,
+               "limit": page_size}
+    elif endpoint == "employee_monthly":
+        need(emp_code=emp_code, month=month)
+        first, last = month_bounds(month)
+        coll = "attendance_logs"
+        cmd = {"aggregate": coll,
+               "pipeline": monthly_pipeline(emp_code, first.isoformat(), last.isoformat()),
+               "cursor": {}, "hint": "uniq_emp_date"}
+    elif endpoint == "department_summary":
+        need(month=month)
+        first, last = month_bounds(month)
+        coll = "employees"
+        cmd = {"aggregate": coll,
+               "pipeline": dept_summary_pipeline(first.isoformat(), last.isoformat(), department),
+               "cursor": {}, "hint": "joined_on_idx"}
+    elif endpoint == "late_leaderboard":
+        need(month=month)
+        first, last = month_bounds(month)
+        coll = "attendance_logs"
+        cmd = {"aggregate": coll,
+               "pipeline": leaderboard_pipeline(first.isoformat(), last.isoformat(), limit, department),
+               "cursor": {}, "hint": "date_desc_emp"}
+    else:
+        need(department=department, range_from=range_from, range_to=range_to)
+        coll = "employees"
+        cmd = {"aggregate": coll,
+               "pipeline": build_trend_pipeline(department, range_from, range_to),
+               "cursor": {}, "hint": "department_idx"}
+
+    raw = db.command("explain", cmd, verbosity="executionStats")
+    explain = json.loads(json_util.dumps(raw))
+    explain.pop("$clusterTime", None)
+    explain.pop("operationTime", None)
+    return {"endpoint": endpoint, "collection": coll, "explain": explain}
 @app.post("/attendance/punch-out")
 def punch_out(body: PunchOutIn):
     emp = db.employees.find_one({"emp_code" : body.emp_code})

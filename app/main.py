@@ -46,6 +46,7 @@ def create_indexes():
         [("emp_code", ASCENDING), ("punch_in", DESCENDING)], name="emp_punch_in",
     )
     db.employees.create_index("emp_code", unique=True, name="uniq_emp_code")
+    db.employees.create_index([("joined_on", ASCENDING)], name="joined_on_idx")
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     create_indexes()
@@ -482,6 +483,106 @@ def employee_monthly(emp_code: str, month: str = Query(..., pattern=MONTH_PATTER
         "total_overtime_minutes": agg.get("total_overtime_minutes", 0),
         "attendance_pct": pct,
     }
+def dept_summary_pipeline(first_iso: str, last_iso: str, department: Optional[str]) -> list:
+    match = {"joined_on": {"$lte": last_iso}}            # R9: joined on/before month end
+    if department:
+        match["department"] = department
+    pres = {"$in": ["$logs.status", PRESENT_STATUSES]}
+    has_wh = {"$gte": [{"$ifNull": ["$logs.work_hours", -1]}, 0]}
+    return [
+        {"$match": match},
+        {"$lookup": {
+            "from": "attendance_logs",
+            "let": {"code": "$emp_code"},
+            "pipeline": [
+                {"$match": {"$expr": {"$and": [
+                    {"$eq": ["$emp_code", "$$code"]},
+                    {"$gte": ["$date", first_iso]},
+                    {"$lte": ["$date", last_iso]},
+                ]}}},
+                {"$addFields": {"dow": {"$dayOfWeek": {
+                    "$dateFromString": {"dateString": "$date", "format": "%Y-%m-%d"}}}}},
+            ],
+            "as": "logs",
+        }},
+        {"$unwind": {"path": "$logs", "preserveNullAndEmptyArrays": True}},
+        {"$group": {
+            "_id": "$department",
+            "emps": {"$addToSet": "$emp_code"},
+            "present_days": {"$sum": {"$cond": [
+                {"$and": [pres, {"$gte": ["$logs.dow", 2]}, {"$lte": ["$logs.dow", 6]}]},
+                {"$cond": [{"$eq": [{"$ifNull": ["$logs.half_day", False]}, True]}, 0.5, 1]},
+                0]}},
+            "wh_sum": {"$sum": {"$cond": [{"$and": [pres, has_wh]}, {"$toDecimal": "$logs.work_hours"}, 0]}},
+            "wh_count": {"$sum": {"$cond": [{"$and": [pres, has_wh]}, 1, 0]}},
+            "late_count": {"$sum": {"$cond": [{"$gt": [{"$ifNull": ["$logs.late_minutes", 0]}, 0]}, 1, 0]}},
+            "total_late_minutes": {"$sum": {"$ifNull": ["$logs.late_minutes", 0]}},
+            "leave_count": {"$sum": {"$cond": [{"$eq": ["$logs.status", "LEAVE"]}, 1, 0]}},
+            "on_duty_count": {"$sum": {"$cond": [{"$eq": ["$logs.status", "ON_DUTY"]}, 1, 0]}},
+        }},
+        {"$project": {"_id": 0, "department": "$_id", "headcount": {"$size": "$emps"},
+                      "present_days": 1, "wh_sum": 1, "wh_count": 1, "late_count": 1,
+                      "total_late_minutes": 1, "leave_count": 1, "on_duty_count": 1}},
+        {"$sort": {"department": 1}},
+    ]
+
+
+@app.get("/analytics/departments/summary")
+def department_summary(month: str = Query(..., pattern=MONTH_PATTERN),
+                       department: Optional[str] = None):
+    first, last = month_bounds(month)
+    pipeline = dept_summary_pipeline(first.isoformat(), last.isoformat(), department)
+    items = []
+    for r in db.employees.aggregate(pipeline, hint="joined_on_idx"):
+        avg = None
+        if r["wh_count"]:
+            total = r["wh_sum"].to_decimal() if hasattr(r["wh_sum"], "to_decimal") else Decimal(str(r["wh_sum"]))
+            avg = float((total / r["wh_count"]).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+        items.append({
+            "department": r["department"],
+            "headcount": r["headcount"],
+            "present_days": round_half_up(r["present_days"], 2),
+            "avg_work_hours": avg,
+            "late_count": r["late_count"],
+            "total_late_minutes": r["total_late_minutes"],
+            "leave_count": r["leave_count"],
+            "on_duty_count": r["on_duty_count"],
+        })
+    return {"month": month, "items": items}
+def leaderboard_pipeline(first_iso: str, last_iso: str, limit: int, department: Optional[str]) -> list:
+    pipeline = [
+        {"$match": {"date": {"$gte": first_iso, "$lte": last_iso}}},
+        {"$group": {
+            "_id": "$emp_code",
+            "total_late_minutes": {"$sum": {"$ifNull": ["$late_minutes", 0]}},
+            "late_count": {"$sum": {"$cond": [{"$gt": [{"$ifNull": ["$late_minutes", 0]}, 0]}, 1, 0]}},
+        }},
+        {"$match": {"total_late_minutes": {"$gt": 0}}},
+        {"$lookup": {"from": "employees", "localField": "_id",
+                     "foreignField": "emp_code", "as": "emp"}},
+        {"$unwind": "$emp"},
+    ]
+    if department:
+        pipeline.append({"$match": {"emp.department": department}})
+    pipeline += [
+        {"$setWindowFields": {"sortBy": {"total_late_minutes": -1},
+                              "output": {"rank": {"$rank": {}}}}},
+        {"$match": {"rank": {"$lte": limit}}},
+        {"$sort": {"total_late_minutes": -1, "_id": 1}},
+        {"$project": {"_id": 0, "rank": 1, "emp_code": "$_id", "name": "$emp.name",
+                      "department": "$emp.department", "total_late_minutes": 1, "late_count": 1}},
+    ]
+    return pipeline
+
+
+@app.get("/analytics/leaderboard/late")
+def late_leaderboard(month: str = Query(..., pattern=MONTH_PATTERN),
+                     limit: int = Query(10, ge=1, le=50),
+                     department: Optional[str] = None):
+    first, last = month_bounds(month)
+    pipeline = leaderboard_pipeline(first.isoformat(), last.isoformat(), limit, department)
+    items = list(db.attendance_logs.aggregate(pipeline, hint="date_desc_emp"))
+    return {"month": month, "items": items}
 @app.post("/attendance/punch-out")
 def punch_out(body: PunchOutIn):
     emp = db.employees.find_one({"emp_code" : body.emp_code})
